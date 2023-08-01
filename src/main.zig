@@ -80,6 +80,44 @@ fn RawJSONSeverityLevelPlusConfig(comptime config: type) type {
     };
 }
 
+fn WithSeverity(comptime Severity: type, comptime Config: type) type {
+    const existing: []const std.builtin.Type.StructField = switch (@typeInfo(Config)) {
+        .Struct => |info| info.fields,
+        .Bool, .Int, .Float => .{
+            .name = "value",
+            .type = Config,
+            .default_value = null,
+            .is_comptime = false,
+            .alignment = @alignOf(Config),
+        },
+        else => unreachable,
+    };
+
+    var structFields: [existing.len + 1]std.builtin.Type.StructField = undefined;
+    var decls = [_]std.builtin.Type.Declaration{};
+
+    structFields[0] = .{
+        .name = "severity",
+        .type = Severity,
+        .default_value = null,
+        .is_comptime = false,
+        .alignment = @alignOf(Severity),
+    };
+    inline for (existing, 1..) |field, i| {
+        std.debug.assert(!std.mem.eql(u8, field.name, "severity"));
+        structFields[i] = field;
+    }
+
+    return @Type(.{
+        .Struct = .{
+            .layout = .Auto,
+            .fields = &structFields,
+            .decls = &decls,
+            .is_tuple = false,
+        },
+    });
+}
+
 // Since the JSON includes strings, not enums, we parse the JSON into this intermediate struct, then
 // parse this into a Configuration.
 //

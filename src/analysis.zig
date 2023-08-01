@@ -73,14 +73,6 @@ pub const ASTAnalyzer = struct {
     dupe_import: bool = false,
     file_as_struct: bool = false,
 
-    pub fn set_max_line_length(self: *ASTAnalyzer, max_line_length: u32) void {
-        self.max_line_length = max_line_length;
-    }
-
-    pub fn disable_max_line_length(self: *ASTAnalyzer) void {
-        self.max_line_length = 0;
-    }
-
     // Actually analyzes AST.
     //
     // Caller must deinit the array.
