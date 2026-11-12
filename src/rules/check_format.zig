@@ -15,7 +15,7 @@ pub const CheckFormat = struct {
     ) !void {
         // error-free tree!
         if (tree.errors.len == 0) {
-            const formatted = try tree.render(alloc);
+            const formatted = try tree.renderAlloc(alloc);
             defer alloc.free(formatted);
 
             if (!std.mem.eql(u8, tree.source, formatted)) {

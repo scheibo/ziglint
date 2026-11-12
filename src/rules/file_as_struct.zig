@@ -14,11 +14,10 @@ pub const FileAsStruct = struct {
         _ = self;
         _ = allocator;
 
-        const tags = tree.nodes.items(.tag);
         const rootDecls = tree.rootDecls();
 
         const has_top_level_fields = for (rootDecls) |item| {
-            if (tags[item].isContainerField()) break true;
+            if (tree.nodeTag(item).isContainerField()) break true;
         } else false;
 
         const capitalized = std.ascii.isUpper(std.fs.path.basename(file_name)[0]);

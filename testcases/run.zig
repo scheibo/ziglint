@@ -4,74 +4,91 @@ const std = @import("std");
 
 const MAX_OUTPUT_SIZE = 1024 * 1024; // 1MB
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer std.debug.assert(gpa.deinit() != .leak);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.log.err("usage: {s} <path to ziglint executable>", .{args[0]});
         return;
     }
 
-    const ziglint = try std.fs.realpathAlloc(allocator, args[1]);
+    const ziglint = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
     defer allocator.free(ziglint);
 
-    const stdout = std.io.getStdOut();
-    const stdout_writer = stdout.writer();
-    const stderr_writer = std.io.getStdErr().writer();
-    const use_color = stdout.supportsAnsiEscapeCodes();
+    const stdout = std.Io.File.stdout();
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_file_writer = stdout.writerStreaming(io, &stdout_buf);
+    const stdout_writer = &stdout_file_writer.interface;
+
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_file_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
+    const stderr_writer = &stderr_file_writer.interface;
+
+    const use_color = stdout.supportsAnsiEscapeCodes(io) catch false;
 
     const bold_green_text: []const u8 = if (use_color) "\x1b[1;32m" else "";
     const bold_red_text: []const u8 = if (use_color) "\x1b[1;31m" else "";
     const end_text_fmt: []const u8 = if (use_color) "\x1b[0m" else "";
 
     // iterate over all directories in . and run the integration tests
-    var dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
 
     var iterable = dir.iterate();
-    var entry = try iterable.next();
+    var entry = try iterable.next(io);
 
     var failures = false;
-    while (entry != null) : (entry = try iterable.next()) {
+    while (entry != null) : (entry = try iterable.next(io)) {
         if (entry.?.kind == .directory) {
             const name = entry.?.name;
-            var test_directory = try std.fs.cwd().openDir(name, .{});
-            defer test_directory.close();
+            var test_directory = try std.Io.Dir.cwd().openDir(io, name, .{});
+            defer test_directory.close(io);
 
-            const expected_output = test_directory.readFileAlloc(allocator, "output.txt", MAX_OUTPUT_SIZE) catch |err| {
+            const expected_output = test_directory.readFileAlloc(
+                io,
+                "output.txt",
+                allocator,
+                .limited(MAX_OUTPUT_SIZE),
+            ) catch |err| {
                 switch (err) {
                     error.FileNotFound => {
                         std.log.err("test {s} has no output.txt file — skipping...", .{name});
                         continue;
                     },
                     else => {
-                        std.log.err("unexpected error opening output.txt for test {s}: {}", .{ name, err });
+                        std.log.err("unexpected error opening output.txt for test {s}: {t}", .{ name, err });
                         @panic("panicking...");
                     },
                 }
             };
             defer allocator.free(expected_output);
 
-            const expected_exit_code_text = test_directory.readFileAlloc(allocator, "exitcode.txt", 5) catch null;
+            const expected_exit_code_text = test_directory.readFileAlloc(
+                io,
+                "exitcode.txt",
+                allocator,
+                .limited(5),
+            ) catch null;
             defer {
                 if (expected_exit_code_text) |text| allocator.free(text);
             }
-            const expected_exit_code = if (expected_exit_code_text) |text| (try std.fmt.parseInt(u8, text, 10)) else null;
+            const expected_exit_code = if (expected_exit_code_text) |text|
+                (try std.fmt.parseInt(u8, std.mem.trimEnd(u8, text, "\r\n"), 10))
+            else
+                null;
 
             // log to stdout
             try stdout_writer.print("Running integration test '{s}'...", .{name});
+            try stdout_writer.flush();
             const is_gitignore = std.mem.eql(u8, name, "gitignore");
-            if (is_gitignore) try test_directory.rename(".gitignore-test", ".gitignore");
+            if (is_gitignore) try test_directory.rename(".gitignore-test", test_directory, ".gitignore", io);
 
-            const result = try std.process.Child.run(.{
-                .allocator = allocator,
+            const result = try std.process.run(allocator, io, .{
                 .argv = &.{ziglint},
-                .cwd_dir = test_directory,
+                .cwd = .{ .dir = test_directory },
             });
             defer {
                 allocator.free(result.stderr);
@@ -79,7 +96,7 @@ pub fn main() !void {
             }
 
             if (is_gitignore) {
-                test_directory.rename(".gitignore", ".gitignore-test") catch {
+                test_directory.rename(".gitignore", test_directory, ".gitignore-test", io) catch {
                     std.log.err(
                         "******** FAILED TO RENAME testcases/gitignore/.gitignore-test TO .gitignore ********",
                         .{},
@@ -97,7 +114,11 @@ pub fn main() !void {
             var i: usize = 0;
             while (i < expected.len and i < actual.len) : (i += 1) {
                 std.testing.expectEqualStrings(expected[i], actual[i]) catch {
-                    try stderr_writer.print("An integration test {s}FAILED{s}: '{s}'\n", .{ bold_red_text, end_text_fmt, name });
+                    try stderr_writer.print(
+                        "An integration test {s}FAILED{s}: '{s}'\n",
+                        .{ bold_red_text, end_text_fmt, name },
+                    );
+                    try stderr_writer.flush();
                     failures = true;
                     continue;
                 };
@@ -109,29 +130,42 @@ pub fn main() !void {
                 defer allocator.free(actual_str);
 
                 try stderr_writer.print("EXPECTED:\n{s}\nGOT:\n{s}\n", .{ expected_str, actual_str });
-                try stderr_writer.print("An integration test {s}FAILED{s}: '{s}'\n", .{ bold_red_text, end_text_fmt, name });
+                try stderr_writer.print(
+                    "An integration test {s}FAILED{s}: '{s}'\n",
+                    .{ bold_red_text, end_text_fmt, name },
+                );
+                try stderr_writer.flush();
                 failures = true;
                 continue;
             };
 
             switch (result.term) {
-                .Exited => {
+                .exited => |exit_code| {
                     if (expected_exit_code) |code| {
-                        std.testing.expectEqual(code, result.term.Exited) catch {
-                            try stderr_writer.print("An integration test {s}FAILED{s} by wrong exit code: '{s}'\n", .{ bold_red_text, end_text_fmt, name });
+                        std.testing.expectEqual(code, exit_code) catch {
+                            try stderr_writer.print(
+                                "An integration test {s}FAILED{s} by wrong exit code: '{s}'\n",
+                                .{ bold_red_text, end_text_fmt, name },
+                            );
+                            try stderr_writer.flush();
                             failures = true;
                             continue;
                         };
                     }
                 },
                 else => {
-                    try stderr_writer.print("An integration test {s}FAILED{s} by wrong termination: '{s}'\n", .{ bold_red_text, end_text_fmt, name });
+                    try stderr_writer.print(
+                        "An integration test {s}FAILED{s} by wrong termination: '{s}'\n",
+                        .{ bold_red_text, end_text_fmt, name },
+                    );
+                    try stderr_writer.flush();
                     failures = true;
                     continue;
                 },
             }
 
             try stdout_writer.print(" {s}ok{s}\n", .{ bold_green_text, end_text_fmt });
+            try stdout_writer.flush();
         }
         if (failures) std.process.exit(1);
     }
@@ -140,20 +174,20 @@ pub fn main() !void {
 // Splits by newline and alphabetizes test output
 // Caller must deinit
 fn alphabetize(allocator: std.mem.Allocator, input: []const u8) ![][]const u8 {
-    var list = std.ArrayList([]const u8).init(allocator);
-    defer list.deinit();
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(allocator);
 
     var line_start: usize = 0;
     var idx: usize = 0;
     while (idx < input.len) : (idx += 1) {
         if (input[idx] == '\n') {
             const line = input[line_start..idx];
-            try list.append(line);
+            try list.append(allocator, line);
             line_start = idx + 1;
         }
     }
 
-    const result = try list.toOwnedSlice();
+    const result = try list.toOwnedSlice(allocator);
 
     // sort strings in result alphabetically
     std.sort.insertion([]const u8, result, .{}, less_than);

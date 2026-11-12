@@ -15,14 +15,14 @@ const Version = @import("./semver.zig").Version;
 const ZIGLINT_VERSION = Version{
     .major = 0,
     .minor = 0,
-    .patch = 8,
+    .patch = 9,
     .prerelease = null,
     .build_metadata = @import("comptime_build").GIT_COMMIT_HASH,
 };
 
 const MAX_CONFIG_BYTES = 64 * 1024; // 64kb max
 
-const fields = std.meta.fields(JSONConfiguration);
+const json_field_names = std.meta.fieldNames(JSONConfiguration);
 
 // for sorting
 // TODO figure out the idiomatic way to sort in zig
@@ -30,18 +30,11 @@ fn less_than(_: @TypeOf(.{}), a: analysis.SourceCodeFault, b: analysis.SourceCod
     return a.line_number < b.line_number;
 }
 
-// a comptime BufferedWriter is for some reason not working on Windows
-// we could pass around a writer, but for now I've been lazy and just got a writer every time
-// on Windows
-var stderr = if (builtin.target.os.tag == .windows) null else std.io.bufferedWriter(std.io.getStdErr().writer());
-pub fn stderr_print(comptime format: []const u8, args: anytype) !void {
-    if (builtin.target.os.tag == .windows) {
-        var w = std.io.getStdErr().writer();
-        try w.print(format ++ "\n", args);
-    } else {
-        try stderr.writer().print(format ++ "\n", args);
-        try stderr.flush();
-    }
+pub fn stderr_print(io: std.Io, comptime format: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    try w.interface.print(format ++ "\n", args);
+    try w.interface.flush();
 }
 
 const SeverityParseError = error{
@@ -83,41 +76,36 @@ fn WithRawJSONSeverityLevel(comptime Config: type) type {
 }
 
 fn WithSeverityField(comptime SeverityField: type, comptime Config: type) type {
-    const existing: []const std.builtin.Type.StructField = switch (@typeInfo(Config)) {
-        .@"struct" => |info| info.fields,
-        .bool, .int, .float => &[_]std.builtin.Type.StructField{.{
-            .name = "value",
-            .type = Config,
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(Config),
-        }},
-        else => unreachable,
-    };
+    switch (@typeInfo(Config)) {
+        .@"struct" => |info| {
+            var field_names: [info.field_names.len + 1][]const u8 = undefined;
+            var field_types: [info.field_types.len + 1]type = undefined;
+            var field_attrs: [info.field_attrs.len + 1]std.lang.Type.Struct.FieldAttributes = undefined;
 
-    var structFields: [existing.len + 1]std.builtin.Type.StructField = undefined;
-    var decls = [_]std.builtin.Type.Declaration{};
+            field_names[0] = "severity";
+            field_types[0] = SeverityField;
+            field_attrs[0] = .{};
 
-    structFields[0] = .{
-        .name = "severity",
-        .type = SeverityField,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(SeverityLevel),
-    };
-    inline for (existing, 1..) |field, i| {
-        std.debug.assert(!std.mem.eql(u8, field.name, "severity"));
-        structFields[i] = field;
-    }
+            inline for (info.field_names, info.field_types, info.field_attrs, 1..) |name, T, attrs, i| {
+                std.debug.assert(!std.mem.eql(u8, name, "severity"));
+                field_names[i] = name;
+                field_types[i] = T;
+                field_attrs[i] = attrs;
+            }
 
-    return @Type(.{
-        .@"struct" = .{
-            .layout = .auto,
-            .fields = &structFields,
-            .decls = &decls,
-            .is_tuple = false,
+            return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
         },
-    });
+        .bool, .int, .float => {
+            return @Struct(
+                .auto,
+                null,
+                &.{ "severity", "value" },
+                &.{ SeverityField, Config },
+                &@splat(.{}),
+            );
+        },
+        else => unreachable,
+    }
 }
 
 const BannedPhraseConfig = @import("rules/banned_comment_phrases.zig").BannedPhraseConfig;
@@ -136,9 +124,10 @@ const JSONConfiguration = struct {
     exclude: ?[][]const u8 = null,
     include: ?[][]const u8 = null,
 
-    fn parseSeverityFromString(severity_string: RawJSONSeverityLevel) SeverityLevel {
+    fn parseSeverityFromString(io: std.Io, severity_string: RawJSONSeverityLevel) SeverityLevel {
         return SeverityLevel.parse(severity_string) catch {
             stderr_print(
+                io,
                 "'{s}' is not a valid severity level. " ++
                     "Valid severity levels are 'error', 'warning', and 'disabled'.",
                 .{severity_string},
@@ -147,28 +136,29 @@ const JSONConfiguration = struct {
         };
     }
 
-    fn to_config(self: JSONConfiguration) !Configuration {
+    fn to_config(self: JSONConfiguration, io: std.Io) !Configuration {
         var configuration = Configuration{};
 
-        inline for (std.meta.fields(JSONConfiguration)) |field| {
-            if (@field(self, field.name) != null) {
-                const field_value = @field(self, field.name).?;
-                switch (field.type) {
+        const json_info = @typeInfo(JSONConfiguration).@"struct";
+        inline for (json_info.field_names, json_info.field_types) |field_name, FieldType| {
+            if (@field(self, field_name) != null) {
+                const field_value = @field(self, field_name).?;
+                switch (FieldType) {
                     // convert to SeverityLevel
                     ?RawJSONSeverityLevel => {
-                        const severity = JSONConfiguration.parseSeverityFromString(field_value);
-                        @field(configuration, field.name) = severity;
+                        const severity = JSONConfiguration.parseSeverityFromString(io, field_value);
+                        @field(configuration, field_name) = severity;
                     },
                     // convert to WithSeverityLevel(MaxLineLength)
                     ?WithRawJSONSeverityLevel(MaxLineLength) => {
-                        const severity = JSONConfiguration.parseSeverityFromString(field_value.severity);
+                        const severity = JSONConfiguration.parseSeverityFromString(io, field_value.severity);
 
                         // TODO: can we comptime this somehow?
                         // maybe we can automagically add a method to the struct produced by WithSeverityLevel
                         // that gets the original struct.
                         //
                         // ie WithSeverityLevel(MaxLineLength)#to_original() returns a MaxLineLength
-                        @field(configuration, field.name) = WithSeverityLevel(MaxLineLength){
+                        @field(configuration, field_name) = WithSeverityLevel(MaxLineLength){
                             .severity = severity,
                             .limit = field_value.limit,
                             .url = field_value.url,
@@ -176,11 +166,12 @@ const JSONConfiguration = struct {
                         };
                     },
                     // no conversion needed
-                    ?bool, ?[][]const u8, ?BannedPhraseConfig => @field(configuration, field.name) = field_value,
+                    ?bool, ?[][]const u8, ?BannedPhraseConfig => @field(configuration, field_name) = field_value,
                     else => {
                         try stderr_print(
+                            io,
                             "Couldn't parse type {s} in the Configuation from JSON. Something has gone very wrong.",
-                            .{@typeName(field.type)},
+                            .{@typeName(FieldType)},
                         );
                         @panic("panicking...");
                     },
@@ -206,31 +197,31 @@ const Configuration = struct {
     ///
     /// Does NOT free potentially-allocated memory; we use an ArenaAllocator so it's all freed when ziglint exits.
     pub fn merge(self: *Configuration, other: *const Configuration, alloc: std.mem.Allocator) !void {
-        inline for (std.meta.fields(Configuration)) |field| {
-            if (@field(other, field.name)) |value| {
-                const is_array = field.type == ?[][]const u8;
-                const self_has_value = @field(self, field.name) != null;
+        const cfg_info = @typeInfo(Configuration).@"struct";
+        inline for (cfg_info.field_names, cfg_info.field_types) |field_name, FieldType| {
+            if (@field(other, field_name)) |value| {
+                const is_array = FieldType == ?[][]const u8;
+                const self_has_value = @field(self, field_name) != null;
                 if (is_array and self_has_value) {
                     // merge fields via concatenation
-                    @field(self, field.name) = try std.mem.concat(
+                    @field(self, field_name) = try std.mem.concat(
                         alloc,
                         []const u8,
-                        &.{ @field(self, field.name).?, value },
+                        &.{ @field(self, field_name).?, value },
                     );
                 } else {
                     // merge fields via replacement
-                    @field(self, field.name) = value;
+                    @field(self, field_name) = value;
                 }
             }
         }
     }
 };
 
-fn show_help() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.writeAll(
+fn show_help(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io,
         \\ziglint: configurable static code analysis for the Zig programming language
-        \\report bugs and request features at https://github.com/AnnikaCodes/ziglint
+        \\report bugs and request features at https://github.com/scheibo/ziglint
         \\
         \\usage:
         \\      to analyze code:                      ziglint [options] [files]
@@ -274,7 +265,7 @@ fn show_help() !void {
 }
 
 // look ahead to the next argument to see if it's a "warn" or "warning" directive
-fn get_severity_level(args: [][:0]u8, args_idx: usize) SeverityLevel {
+fn get_severity_level(args: []const [:0]const u8, args_idx: usize) SeverityLevel {
     const next_idx = args_idx + 1;
     if (next_idx >= args.len) return SeverityLevel.Error; // default to Error
 
@@ -290,18 +281,12 @@ fn is_warning(text: []const u8) bool {
     return (std.mem.eql(u8, trimmed, "warn") or std.mem.eql(u8, trimmed, "warning"));
 }
 
-pub fn main() anyerror!void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer std.debug.assert(gpa.deinit() != .leak);
+pub fn main(init: std.process.Init) anyerror!void {
+    const allocator = init.gpa;
+    const arena_allocator = init.arena.allocator();
+    const io = init.io;
 
-    // use an ArenaAllocator for everything that's not per-file
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(arena_allocator);
 
     // check for subcommads
     if (args.len >= 2) {
@@ -310,24 +295,26 @@ pub fn main() anyerror!void {
             var override_url: ?[]const u8 = null;
             if (args.len >= 3) {
                 override_url = args[2];
-                try stderr_print("overriding GitHub API URL to {s}", .{override_url.?});
+                try stderr_print(io, "overriding GitHub API URL to {s}", .{override_url.?});
             }
-            try upgrade.upgrade(arena_allocator, ZIGLINT_VERSION, override_url);
+            try upgrade.upgrade(io, arena_allocator, ZIGLINT_VERSION, override_url);
             return;
         } else if (std.mem.eql(u8, args[1], "version")) {
-            const stdout = std.io.getStdOut().writer();
-            try stdout.print("{}\n", .{ZIGLINT_VERSION});
+            var buf: [256]u8 = undefined;
+            var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+            try stdout.interface.print("{f}\n", .{ZIGLINT_VERSION});
+            try stdout.interface.flush();
             return;
         } else if (std.mem.eql(u8, args[1], "help")) {
-            return show_help();
+            return show_help(io);
         }
     }
 
     // check for switches/arguments
     var args_idx: usize = 1;
     var switches = Configuration{};
-    var cmd_line_files = std.ArrayList([]const u8).init(arena_allocator);
-    defer cmd_line_files.deinit();
+    var cmd_line_files: std.ArrayList([]const u8) = .empty;
+    defer cmd_line_files.deinit(arena_allocator);
 
     while (args_idx < args.len) : (args_idx += 1) {
         const arg = args[args_idx];
@@ -339,6 +326,7 @@ pub fn main() anyerror!void {
                 args_idx += 1;
                 if (args_idx >= args.len) {
                     try stderr_print(
+                        io,
                         "--max-line-length requires an argument; use `ziglint help` for more information",
                         .{},
                     );
@@ -356,10 +344,15 @@ pub fn main() anyerror!void {
                 const max_len = std.fmt.parseInt(u32, len_string, 10) catch |err| {
                     switch (err) {
                         error.InvalidCharacter => {
-                            try stderr_print("invalid (non-digit) character in '--max-line-length {s}'", .{len_string});
+                            try stderr_print(
+                                io,
+                                "invalid (non-digit) character in '--max-line-length {s}'",
+                                .{len_string},
+                            );
                         },
                         error.Overflow => {
                             try stderr_print(
+                                io,
                                 "--max-line-length value {s} doesn't fit in a 32-bit unsigned integer",
                                 .{len_string},
                             );
@@ -381,29 +374,29 @@ pub fn main() anyerror!void {
             } else if (is_include or is_exclude) {
                 args_idx += 1;
                 if (args_idx >= args.len) {
-                    try stderr_print("{s} requires an argument of comma-spearated globs; " ++
+                    try stderr_print(io, "{s} requires an argument of comma-spearated globs; " ++
                         "use `ziglint help` for more information", .{arg});
                     std.process.exit(1);
                 }
 
                 var split = std.mem.splitScalar(u8, args[args_idx], ',');
-                var globs = std.ArrayList([]const u8).init(arena_allocator);
+                var globs: std.ArrayList([]const u8) = .empty;
                 while (split.next()) |glob| {
-                    try globs.append(glob);
+                    try globs.append(arena_allocator, glob);
                 }
 
                 if (is_include) {
-                    switches.include = try globs.toOwnedSlice();
+                    switches.include = try globs.toOwnedSlice(arena_allocator);
                 } else if (is_exclude) {
-                    switches.exclude = try globs.toOwnedSlice();
+                    switches.exclude = try globs.toOwnedSlice(arena_allocator);
                 } else unreachable;
             } else {
-                try stderr_print("unknown switch: {s}\n", .{arg});
-                try show_help();
+                try stderr_print(io, "unknown switch: {s}\n", .{arg});
+                try show_help(io);
                 std.process.exit(1);
             }
         } else {
-            try cmd_line_files.append(arg);
+            try cmd_line_files.append(arena_allocator, arg);
         }
     }
 
@@ -411,21 +404,18 @@ pub fn main() anyerror!void {
     // or double-lint files due to symlinks.
     var seen = std.StringHashMap(void).init(arena_allocator);
     defer {
-        // free all the keys, which got put here from std.fs.realpathAlloc() allocations
-        // with the non-arena (per-file) allocator
         var key_iterator = seen.keyIterator();
         while (key_iterator.next()) |key| {
             allocator.free(key.*);
         }
-
-        // no need to free the hashmap itself as it's arena-allocated
         seen.deinit();
     }
 
+    const cwd_path = try std.process.currentPathAlloc(io, arena_allocator);
     const files = if (cmd_line_files.items.len > 0) cmd_line_files.items else &[_][]const u8{"."};
     var fault_count: u64 = 0;
     for (files) |file| {
-        const config_file_parsed = try get_config(file, arena_allocator, switches.verbose orelse false);
+        const config_file_parsed = try get_config(io, file, arena_allocator, switches.verbose orelse false);
         var config = switches;
 
         if (config_file_parsed) |c| {
@@ -434,13 +424,13 @@ pub fn main() anyerror!void {
         }
 
         var analyzer = analysis.ASTAnalyzer{};
-        inline for (std.meta.fields(analysis.ASTAnalyzer)) |field| {
-            if (@field(config, field.name)) |value| {
+        inline for (@typeInfo(analysis.ASTAnalyzer).@"struct".field_names) |field_name| {
+            if (@field(config, field_name)) |value| {
                 // the AST analyzer doesn't need to know if it's an error or warning.
-                @field(analyzer, field.name) = switch (@TypeOf(value)) {
+                @field(analyzer, field_name) = switch (@TypeOf(value)) {
                     SeverityLevel => value != .Disabled,
                     SeverityLevelPlusConfig(u32) => if (value.severity == .Disabled) 0 else value.config,
-                    // TODO: can we automate this with std.meta.fields or other comptime trickery?
+                    // TODO: can we automate this with std.meta.fieldNames or other comptime trickery?
                     WithSeverityLevel(MaxLineLength) => MaxLineLength{
                         .limit = if (value.severity == .Disabled) 0 else value.limit,
                         .url = value.url,
@@ -451,7 +441,7 @@ pub fn main() anyerror!void {
             }
         }
 
-        var ignore_tracker = IgnoreTracker.init(arena_allocator, file);
+        var ignore_tracker = IgnoreTracker.init(arena_allocator, cwd_path, init.environ_map, file);
         defer ignore_tracker.deinit();
 
         if (config.exclude) |excludes| try ignore_tracker.add_slice_to_excludes(excludes);
@@ -460,34 +450,44 @@ pub fn main() anyerror!void {
         var gitignore_text: ?[]const u8 = null;
 
         if (config.include_gitignored != false) {
-            const gitignore_path = try find_file(arena_allocator, file, ".gitignore");
+            const gitignore_path = try find_file(io, arena_allocator, file, ".gitignore");
             if (gitignore_path) |path| {
-                if (config.verbose orelse false) try stderr_print("using Gitignore {s}", .{path});
+                if (config.verbose orelse false) try stderr_print(io, "using Gitignore {s}", .{path});
 
-                gitignore_text = try std.fs.cwd().readFileAlloc(arena_allocator, path, MAX_CONFIG_BYTES);
+                gitignore_text = try std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    path,
+                    arena_allocator,
+                    .limited(MAX_CONFIG_BYTES),
+                );
                 try ignore_tracker.parse_gitignore(gitignore_text.?);
             }
         }
 
-        fault_count += try lint(file, allocator, analyzer, &ignore_tracker, &seen, config, true);
+        fault_count += try lint(io, file, allocator, analyzer, &ignore_tracker, &seen, config, true);
     }
 
     if (fault_count >= 256) {
         // too many faults to exit with
-        try stderr_print("error: too many faults ({}) to exit with the correct exit code", .{fault_count});
+        try stderr_print(io, "error: too many faults ({d}) to exit with the correct exit code", .{fault_count});
         std.process.exit(255);
     }
     std.process.exit(@as(u8, @intCast(fault_count)));
 }
 
 // Creates a Configuration object for the given file based on the nearest ziglintrc file.
-fn get_config(file_name: []const u8, alloc: std.mem.Allocator, verbose: bool) !?std.json.Parsed(Configuration) {
-    const ziglintrc_path = try find_file(alloc, file_name, "ziglint.json");
+fn get_config(
+    io: std.Io,
+    file_name: []const u8,
+    alloc: std.mem.Allocator,
+    verbose: bool,
+) !?std.json.Parsed(Configuration) {
+    const ziglintrc_path = try find_file(io, alloc, file_name, "ziglint.json");
     if (ziglintrc_path) |path| {
         defer alloc.free(path);
 
-        if (verbose) try stderr_print("using config file {s}", .{path});
-        const config_raw = try std.fs.cwd().readFileAlloc(alloc, path, MAX_CONFIG_BYTES);
+        if (verbose) try stderr_print(io, "using config file {s}", .{path});
+        const config_raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(MAX_CONFIG_BYTES));
         const possible_json_cfg = std.json.parseFromSlice(
             JSONConfiguration,
             alloc,
@@ -496,19 +496,20 @@ fn get_config(file_name: []const u8, alloc: std.mem.Allocator, verbose: bool) !?
         ) catch |err| err_handle_blk: {
             switch (err) {
                 error.UnknownField => {
-                    var field_names: [fields.len][]const u8 = undefined;
-                    inline for (fields, 0..) |field, i| {
-                        field_names[i] = field.name;
+                    var field_names: [json_field_names.len][]const u8 = undefined;
+                    inline for (json_field_names, 0..) |field_name, i| {
+                        field_names[i] = field_name;
                     }
                     const fields_str = try std.mem.join(alloc, ", ", &field_names);
                     defer alloc.free(fields_str);
 
                     try stderr_print(
+                        io,
                         "error: an unknown field was encountered in ziglint.json\nValid top-level fields are: {s}",
                         .{fields_str},
                     );
                 },
-                else => try stderr_print("error: couldn't parse ziglint.json: {any}", .{err}),
+                else => try stderr_print(io, "error: couldn't parse ziglint.json: {any}", .{err}),
             }
             break :err_handle_blk null;
         };
@@ -516,26 +517,25 @@ fn get_config(file_name: []const u8, alloc: std.mem.Allocator, verbose: bool) !?
             return .{
                 .arena = json_cfg.arena,
                 // convert JSONConfiguration -> Configuration and parse the severity levels into enums
-                .value = try json_cfg.value.to_config(),
+                .value = try json_cfg.value.to_config(io),
             };
         }
     }
 
-    if (verbose) try stderr_print("warning: no valid ziglint.json found! using default configuration.", .{});
+    if (verbose) try stderr_print(io, "warning: no valid ziglint.json found! using default configuration.", .{});
     return null;
 }
 
 // finds a ziglintrc file in the given directory or any parent directory
 // caller needs to free the result if it's there
-fn find_file(alloc: std.mem.Allocator, file_name: []const u8, search_name: []const u8) !?[]const u8 {
+fn find_file(io: std.Io, alloc: std.mem.Allocator, file_name: []const u8, search_name: []const u8) !?[]const u8 {
     var is_dir = false;
-    if (std.fs.cwd().openFile(file_name, .{})) |file| {
-        is_dir = ((try file.stat()).kind == .directory);
-        file.close();
+    if (std.Io.Dir.cwd().statFile(io, file_name, .{})) |stat| {
+        is_dir = (stat.kind == .directory);
     } else |err| {
         switch (err) {
             error.FileNotFound => {
-                try stderr_print("error: file not found: {s}", .{file_name});
+                try stderr_print(io, "error: file not found: {s}", .{file_name});
                 std.process.exit(1);
             },
             error.IsDir => is_dir = true,
@@ -543,18 +543,18 @@ fn find_file(alloc: std.mem.Allocator, file_name: []const u8, search_name: []con
         }
     }
 
-    const full_path = try std.fs.realpathAlloc(alloc, file_name);
-    defer alloc.free(full_path);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try std.Io.Dir.cwd().realPathFile(io, file_name, &path_buf);
+    const full_path = path_buf[0..path_len];
     var nearest_dir = if (is_dir) full_path else std.fs.path.dirname(full_path);
 
     while (nearest_dir != null) {
         const ziglintrc = try std.fs.path.join(alloc, &[_][]const u8{ nearest_dir.?, search_name });
-        const stat = std.fs.cwd().statFile(ziglintrc);
-        if (stat != error.FileNotFound) {
-            _ = try stat; // return error if there is one
+        if (std.Io.Dir.cwd().statFile(io, ziglintrc, .{})) |_| {
             return ziglintrc;
-        } else {
-            alloc.free(ziglintrc);
+        } else |err| switch (err) {
+            error.FileNotFound => alloc.free(ziglintrc),
+            else => return err,
         }
 
         nearest_dir = std.fs.path.dirname(nearest_dir.?);
@@ -568,6 +568,7 @@ fn find_file(alloc: std.mem.Allocator, file_name: []const u8, search_name: []con
 //
 // Returns the number of faults found.
 fn lint(
+    io: std.Io,
     file_name: []const u8,
     alloc: std.mem.Allocator,
     analyzer: analysis.ASTAnalyzer,
@@ -577,27 +578,39 @@ fn lint(
     is_top_level: bool,
 ) anyerror!u64 {
     // we need the full, not relative, path to make sure we avoid symlink loops
-    const real_path = try std.fs.realpathAlloc(alloc, file_name);
-    if (seen.contains(real_path)) {
-        // we need to free the `real_path` memory here since we're not adding it to the hashmap
-        alloc.free(real_path);
-        return 0; // no faults, since we already checked this path
-    } else {
-        try seen.put(real_path, {});
-    }
-
-    const file = std.fs.cwd().openFile(file_name, .{}) catch |err| {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_path_len = std.Io.Dir.cwd().realPathFile(io, file_name, &path_buf) catch |err| {
         switch (err) {
-            error.AccessDenied => try stderr_print("error: access denied: '{s}'", .{file_name}),
-            error.DeviceBusy => try stderr_print("error: device busy: '{s}'", .{file_name}),
-            error.FileNotFound => try stderr_print("error: file not found: '{s}'", .{file_name}),
-            error.FileTooBig => try stderr_print("error: file too big: '{s}'", .{file_name}),
+            error.AccessDenied => try stderr_print(io, "error: access denied: '{s}'", .{file_name}),
+            error.FileNotFound => try stderr_print(io, "error: file not found: '{s}'", .{file_name}),
+            error.SymLinkLoop => try stderr_print(io, "error: symlink loop: '{s}'", .{file_name}),
+            else => try stderr_print(io, "error: couldn't resolve '{s}': {t}", .{ file_name, err }),
+        }
+        if (is_top_level) std.process.exit(1);
+        return 0;
+    };
+    const real_path_slice = path_buf[0..real_path_len];
+    if (seen.contains(real_path_slice)) {
+        return 0; // no faults, since we already checked this path
+    }
+    const real_path = try alloc.dupe(u8, real_path_slice);
+    try seen.put(real_path, {});
+
+    const file = std.Io.Dir.cwd().openFile(io, file_name, .{
+        .allow_directory = if (builtin.target.os.tag == .windows) false else true,
+    }) catch |err| {
+        switch (err) {
+            error.AccessDenied => try stderr_print(io, "error: access denied: '{s}'", .{file_name}),
+            error.DeviceBusy => try stderr_print(io, "error: device busy: '{s}'", .{file_name}),
+            error.FileNotFound => try stderr_print(io, "error: file not found: '{s}'", .{file_name}),
+            error.FileTooBig => try stderr_print(io, "error: file too big: '{s}'", .{file_name}),
 
             error.SymLinkLoop => {
                 // symlink loops should be caught by our hashmap of seen files
                 // if not, we have a problem, so let's check
                 if (!seen.contains(real_path)) {
                     try stderr_print(
+                        io,
                         "error: couldn't open '{s}' due to a symlink loop, " ++
                             "but it still hasn't been linted (full path: {s})",
                         .{ file_name, real_path },
@@ -607,10 +620,10 @@ fn lint(
 
             // Windows can't open a directory with openFile, apparently.
             error.IsDir => {
-                return try walk_directory(file_name, alloc, analyzer, ignore_tracker, seen, config);
+                return try walk_directory(io, file_name, alloc, analyzer, ignore_tracker, seen, config);
             },
 
-            else => try stderr_print("error: couldn't open '{s}': {}", .{ file_name, err }),
+            else => try stderr_print(io, "error: couldn't open '{s}': {t}", .{ file_name, err }),
         }
 
         // exit the program if the *user* specified an inaccessible file;
@@ -621,10 +634,10 @@ fn lint(
             return 0;
         }
     };
-    defer file.close();
+    defer file.close(io);
 
-    const metadata = try file.metadata(); // TODO: is .stat() faster?
-    const kind = metadata.kind();
+    const stat = try file.stat(io);
+    const kind = stat.kind;
     var fault_count: u64 = 0;
     switch (kind) {
         .file => {
@@ -636,14 +649,14 @@ fn lint(
             }
 
             // lint it
-            const contents = try alloc.allocSentinel(u8, metadata.size(), 0);
+            const contents = try alloc.allocSentinel(u8, @intCast(stat.size), 0);
             defer alloc.free(contents);
-            _ = file.readAll(contents) catch |err| {
-                try stderr_print("error: couldn't read '{s}': {}", .{ file_name, err });
+            _ = file.readPositionalAll(io, contents, 0) catch |err| {
+                try stderr_print(io, "error: couldn't read '{s}': {t}", .{ file_name, err });
                 return fault_count;
             };
 
-            var ast = try std.zig.Ast.parse(alloc, contents, .zig);
+            var ast = try std.zig.Ast.parse(alloc, contents, .{});
             defer ast.deinit(alloc);
             var faults = try analyzer.analyze(alloc, file_name, ast);
             defer faults.deinit();
@@ -652,10 +665,12 @@ fn lint(
 
             const sorted_faults = std.sort.insertion(analysis.SourceCodeFault, faults.faults.items, .{}, less_than);
             _ = sorted_faults;
-            const stdout = std.io.getStdOut();
-            const stdout_writer = stdout.writer();
+            const stdout = std.Io.File.stdout();
+            var stdout_buf: [4096]u8 = undefined;
+            var stdout_file_writer = stdout.writerStreaming(io, &stdout_buf);
+            const stdout_writer = &stdout_file_writer.interface;
 
-            const use_color: bool = stdout.supportsAnsiEscapeCodes();
+            const use_color: bool = stdout.supportsAnsiEscapeCodes(io) catch false;
             const bold_text: []const u8 = if (use_color) "\x1b[1m" else "";
             const red_text: []const u8 = if (use_color) "\x1b[31m" else "";
             const yellow_text: []const u8 = if (use_color) "\x1b[33m" else "";
@@ -664,7 +679,7 @@ fn lint(
             // const bold_magenta: []const u8 = if (use_color) "\x1b[1;35m" else "";
             const end_text_fmt: []const u8 = if (use_color) "\x1b[0m" else "";
             for (faults.faults.items) |fault| {
-                try stdout_writer.print("{s}{s}:{}:{}{s}: ", .{
+                try stdout_writer.print("{s}{s}:{d}:{d}{s}: ", .{
                     bold_text,
                     file_name,
                     fault.line_number,
@@ -682,7 +697,7 @@ fn lint(
                         }
 
                         try stdout_writer.print(
-                            "line is {s}{} characters long{s}; the maximum is {}",
+                            "line is {s}{d} characters long{s}; the maximum is {d}",
                             .{ fault_formatting, len, end_text_fmt, analyzer.max_line_length.limit },
                         );
                     },
@@ -750,13 +765,15 @@ fn lint(
 
                 if (!warning) fault_count += 1;
             }
+            try stdout_writer.flush();
         },
         .directory => {
-            fault_count += try walk_directory(file_name, alloc, analyzer, ignore_tracker, seen, config);
+            fault_count += try walk_directory(io, file_name, alloc, analyzer, ignore_tracker, seen, config);
         },
         else => {
             try stderr_print(
-                "ignoring '{s}', which is not a file or directory, but a(n) {}.",
+                io,
+                "ignoring '{s}', which is not a file or directory, but a(n) {t}.",
                 .{ file_name, kind },
             );
         },
@@ -767,6 +784,7 @@ fn lint(
 // iterate over a directory and lint
 // returns # of faults found
 fn walk_directory(
+    io: std.Io,
     file_name: []const u8,
     alloc: std.mem.Allocator,
     analyzer: analysis.ASTAnalyzer,
@@ -775,16 +793,16 @@ fn walk_directory(
     config: Configuration,
 ) !u64 {
     // todo: is walker faster?
-    var dir = try std.fs.cwd().openDir(file_name, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, file_name, .{ .iterate = true });
+    defer dir.close(io);
 
     var iterable = dir.iterate();
-    var entry = try iterable.next();
+    var entry = try iterable.next(io);
     var fault_count: u64 = 0;
-    while (entry != null) : (entry = try iterable.next()) {
+    while (entry != null) : (entry = try iterable.next(io)) {
         const full_name = try std.fs.path.join(alloc, &[_][]const u8{ file_name, entry.?.name });
         defer alloc.free(full_name);
-        fault_count += try lint(full_name, alloc, analyzer, ignore_tracker, seen, config, false);
+        fault_count += try lint(io, full_name, alloc, analyzer, ignore_tracker, seen, config, false);
     }
     return fault_count;
 }

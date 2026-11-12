@@ -19,13 +19,13 @@ pub const DupeImport = struct {
         _: std.mem.Allocator,
         fault_tracker: *analysis.SourceCodeFaultTracker,
         tree: std.zig.Ast,
-        node_idx: u32,
+        node_idx: std.zig.Ast.Node.Index,
     ) !void {
-        const node = tree.nodes.get(node_idx);
-        if (!std.mem.eql(u8, tree.tokenSlice(node.main_token), "@import")) return;
+        const main_token = tree.nodeMainToken(node_idx);
+        if (!std.mem.eql(u8, tree.tokenSlice(main_token), "@import")) return;
 
-        const location = tree.tokenLocation(0, node.main_token);
-        const result = try self.imports.getOrPut(tree.tokenSlice(node.main_token + 2));
+        const location = tree.tokenLocation(0, main_token);
+        const result = try self.imports.getOrPut(tree.tokenSlice(main_token + 2));
         if (!result.found_existing) {
             result.value_ptr.* = location;
         } else {

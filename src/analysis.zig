@@ -25,12 +25,14 @@ pub const SourceCodeFault = struct {
 };
 
 pub const SourceCodeFaultTracker = struct {
+    alloc: std.mem.Allocator,
     faults: std.ArrayList(SourceCodeFault),
     ziglint_disabled_lines: std.AutoHashMap(usize, void),
 
     pub fn new(alloc: std.mem.Allocator) SourceCodeFaultTracker {
         return SourceCodeFaultTracker{
-            .faults = std.ArrayList(SourceCodeFault).init(alloc),
+            .alloc = alloc,
+            .faults = .empty,
             // https://github.com/ziglang/zig/issues/6919 :(
             .ziglint_disabled_lines = std.AutoHashMap(usize, void).init(alloc),
         };
@@ -49,11 +51,11 @@ pub const SourceCodeFaultTracker = struct {
         if (self.ziglint_disabled_lines.get(fault.line_number) != null) {
             return;
         }
-        try self.faults.append(fault);
+        try self.faults.append(self.alloc, fault);
     }
 
     pub fn deinit(self: *SourceCodeFaultTracker) void {
-        self.faults.deinit();
+        self.faults.deinit(self.alloc);
         self.ziglint_disabled_lines.deinit();
     }
 };
@@ -167,7 +169,7 @@ pub const ASTAnalyzer = struct {
         var i: u32 = 0;
         while (i < tree.nodes.len) : (i += 1) {
             // run per-node rules
-            if (self.dupe_import) try dupe_import.check_node(alloc, &faults, tree, i);
+            if (self.dupe_import) try dupe_import.check_node(alloc, &faults, tree, @fromBackingInt(@intCast(i)));
         }
         return faults;
     }
@@ -194,7 +196,7 @@ const Tests = struct {
 
     fn run_tests(analyzer: *const ASTAnalyzer, comptime cases: []const TestCase) !void {
         inline for (cases) |case| {
-            var tree = try std.zig.Ast.parse(std.testing.allocator, case.source, .zig);
+            var tree = try std.zig.Ast.parse(std.testing.allocator, case.source, .{});
             defer tree.deinit(std.testing.allocator);
 
             var faults = try analyzer.analyze(std.testing.allocator, "name", tree);

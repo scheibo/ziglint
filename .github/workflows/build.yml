@@ -1,44 +1,63 @@
 # Builds a `ziglint` binary and posts it to GH
 
-on:
-    release:
-        types: [created]
-    push:
-        branches: [main]
-
 name: Build/Publish Binary
-jobs:
-    build_publish:
-        strategy:
-            matrix:
-                cpu: [x86_64, aarch64]
-                os: [linux, macos, windows]
-        runs-on: ubuntu-latest
-        env:
-            GH_TOKEN: ${{ github.token }}
-        steps:
-            - uses: actions/checkout@v2
-            - name: Install nightly Zig
-              uses: goto-bus-stop/setup-zig@v1
-              with:
-                version: 0.14.1
-            - name: Set compile options (release)
-              if: ${{ github.event_name == 'release' }}
-              run: echo "OPTIONS=-Dno-git-hash=true" >> "$GITHUB_ENV"
-            - name: Compile
-              run: zig build -Dtarget=${{ matrix.cpu }}-${{ matrix.os }} -Doptimize=ReleaseFast ${{ env.OPTIONS }}
-            - name: Set binary suffix (Windows)
-              if: ${{ matrix.os == 'windows' }}
-              run: echo "SUFFIX=.exe" >> "$GITHUB_ENV"
-            - name: Upload (existing release)
-              if: ${{ github.event_name == 'release'}}
-              run: |
-                mv zig-out/bin/ziglint${{ env.SUFFIX }} zig-out/bin/ziglint-${{ matrix.os }}-${{ matrix.cpu }}${{ env.SUFFIX }}
-                gh release upload ${{ github.event.release.tag_name }} zig-out/bin/*${{ env.SUFFIX }}
-            - name: Upload (HEAD)
-              if: ${{ github.event_name == 'push' }}
-              run: |
-                mv zig-out/bin/ziglint${{ env.SUFFIX }} zig-out/bin/ziglint-${{ matrix.os }}-${{ matrix.cpu }}${{ env.SUFFIX }}
-                gh release upload latest zig-out/bin/*${{ env.SUFFIX }} --clobber
-                gh release edit --target ${{ github.sha }} latest
 
+on:
+  release:
+    types: [created]
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare_latest:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure latest prerelease exists
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --target "${{ github.sha }}" --prerelease
+          else
+            gh release create latest --prerelease --target "${{ github.sha }}" --title "Latest" --notes "Latest build"
+          fi
+
+  build_publish:
+    needs: [prepare_latest]
+    if: ${{ always() && (github.event_name == 'release' || needs.prepare_latest.result == 'success') }}
+    strategy:
+      matrix:
+        cpu: [x86_64, aarch64]
+        os: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: Set compile options (release)
+        if: ${{ github.event_name == 'release' }}
+        run: echo "OPTIONS=-Dno-git-hash=true" >> "$GITHUB_ENV"
+      - name: Compile
+        run: zig build -Dtarget=${{ matrix.cpu }}-${{ matrix.os }} -Doptimize=ReleaseFast ${{ env.OPTIONS }}
+      - name: Set binary suffix (Windows)
+        if: ${{ matrix.os == 'windows' }}
+        run: echo "SUFFIX=.exe" >> "$GITHUB_ENV"
+      - name: Upload (existing release)
+        if: ${{ github.event_name == 'release' }}
+        run: |
+          mv zig-out/bin/ziglint${{ env.SUFFIX }} zig-out/bin/ziglint-${{ matrix.os }}-${{ matrix.cpu }}${{ env.SUFFIX }}
+          gh release upload "${{ github.event.release.tag_name }}" zig-out/bin/ziglint-${{ matrix.os }}-${{ matrix.cpu }}${{ env.SUFFIX }} --clobber
+      - name: Upload (HEAD)
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          mv zig-out/bin/ziglint${{ env.SUFFIX }} zig-out/bin/ziglint-${{ matrix.os }}-${{ matrix.cpu }}${{ env.SUFFIX }}
+          gh release upload latest zig-out/bin/ziglint-${{ matrix.os }}-${{ matrix.cpu }}${{ env.SUFFIX }} --clobber

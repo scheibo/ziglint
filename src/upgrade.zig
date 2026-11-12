@@ -6,20 +6,20 @@ const semver = @import("./semver.zig");
 const stderr_print = @import("./main.zig").stderr_print;
 
 const RELEASE_API_URI =
-    std.Uri.parse("https://api.github.com/repos/AnnikaCodes/ziglint/releases/latest") catch unreachable;
-// currently redirects to https://api.github.com/repos/AnnikaCodes/ziglint/releases/latest
-const FALLBACK_API_URI = std.Uri.parse("https://ziglint.worldbrightening.net/latestreleaseapi") catch unreachable;
-const MAX_API_RESPONSE_SIZE = 64 * 1024; // 64 kilobytes
+    std.Uri.parse("https://api.github.com/repos/scheibo/ziglint/releases/latest") catch unreachable;
+const FALLBACK_API_URI =
+    std.Uri.parse("https://api.github.com/repos/scheibo/ziglint/releases/tags/latest") catch unreachable;
 
 const GithubReleaseAsset = struct {
     url: []const u8,
+    browser_download_url: ?[]const u8 = null,
     name: []const u8,
     content_type: []const u8,
     size: u32,
 
-    pub fn format(value: GithubReleaseAsset, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(value: GithubReleaseAsset, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print(
-            "GithubReleaseAsset{{ .name = \"{s}\", .url = \"{s}\", .size = {}, .content_type = \"{s}\" }}",
+            "GithubReleaseAsset{{ .name = \"{s}\", .url = \"{s}\", .size = {d}, .content_type = \"{s}\" }}",
             .{ value.name, value.url, value.size, value.content_type },
         );
     }
@@ -32,43 +32,47 @@ const GithubRelease = struct {
     name: []const u8,
     assets: []GithubReleaseAsset,
 
-    pub fn format(value: GithubRelease, comptime fmt: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
+    pub fn format(value: GithubRelease, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("GithubRelease{{\n", .{});
-        inline for (std.meta.fields(GithubRelease)) |field| {
-            try writer.print("    .{s} = ", .{field.name});
-            switch (field.type) {
-                []const u8 => try writer.print("\"{s}\",\n", .{@field(value, field.name)}),
+        const info = @typeInfo(GithubRelease).@"struct";
+        inline for (info.field_names, info.field_types) |field_name, FieldType| {
+            try writer.print("    .{s} = ", .{field_name});
+            switch (FieldType) {
+                []const u8 => try writer.print("\"{s}\",\n", .{@field(value, field_name)}),
                 []GithubReleaseAsset => {
                     try writer.print("[\n", .{});
-                    for (@field(value, field.name)) |asset| {
-                        try writer.print("        {},\n", .{asset});
+                    for (@field(value, field_name)) |asset| {
+                        try writer.print("        {f},\n", .{asset});
                     }
                     try writer.print("    ],\n", .{});
                 },
-                else => try writer.print("{},\n", .{@field(value, field.name)}),
+                else => try writer.print("{any},\n", .{@field(value, field_name)}),
             }
         }
         try writer.print("}}", .{});
     }
 };
 
-pub fn upgrade(alloc: std.mem.Allocator, current_version: semver.Version, override_url: ?[]const u8) !void {
+pub fn upgrade(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    current_version: semver.Version,
+    override_url: ?[]const u8,
+) !void {
     const api_url = if (override_url == null) RELEASE_API_URI else std.Uri.parse(override_url.?) catch |err| errblk: {
         try stderr_print(
-            "couldn't parse specified API URL '{s}' ({}); using the default GitHub endpoint instead",
+            io,
+            "couldn't parse specified API URL '{s}' ({t}); using the default GitHub endpoint instead",
             .{ override_url.?, err },
         );
         break :errblk RELEASE_API_URI;
     };
 
-    var api_buffer = try alloc.alloc(u8, MAX_API_RESPONSE_SIZE);
-    defer alloc.free(api_buffer);
-
-    const latest_release = access_api(alloc, api_url, api_buffer) catch |err| blk: {
+    const latest_release = access_api(io, alloc, api_url) catch |err| blk: {
         switch (err) {
             error.MissingField => {
                 try stderr_print(
+                    io,
                     "error: couldn't parse latest release JSON: missing important field\n" ++
                         "maybe the API URL is broken, GitHub has changed their API, or there's no latest release?\n",
                     .{},
@@ -79,10 +83,14 @@ pub fn upgrade(alloc: std.mem.Allocator, current_version: semver.Version, overri
         }
 
         if (override_url == null) {
-            try stderr_print("error: couldn't access GitHub API endpoint due to {}; trying fallback endpoint", .{err});
-            break :blk try access_api(alloc, FALLBACK_API_URI, api_buffer);
+            try stderr_print(
+                io,
+                "error: couldn't access GitHub API endpoint due to {t}; trying fallback endpoint",
+                .{err},
+            );
+            break :blk try access_api(io, alloc, FALLBACK_API_URI);
         } else {
-            try stderr_print("error: couldn't access GitHub API endpoint due to {}", .{err});
+            try stderr_print(io, "error: couldn't access GitHub API endpoint due to {t}", .{err});
             std.process.exit(1);
         }
     };
@@ -91,19 +99,21 @@ pub fn upgrade(alloc: std.mem.Allocator, current_version: semver.Version, overri
     var release_name = latest_release.value.name;
     const latest_version = semver.Version.parse(release_name) catch errblk: {
         // try cutting off the leading "v" if it exists
-        if (release_name[0] == 'v') {
+        if (release_name.len > 0 and release_name[0] == 'v') {
             release_name = release_name[1..];
-            break :errblk semver.Version.parse(release_name[1..]) catch {
-                log_failure_to_parse_version_and_exit(release_name);
+            break :errblk semver.Version.parse(release_name) catch {
+                log_failure_to_parse_version_and_exit(io, release_name);
             };
         }
         // cut off stuff before a space
         const space = std.mem.indexOf(u8, release_name, " ");
         if (space) |space_idx| {
             release_name = release_name[space_idx + 1 ..];
-            break :errblk semver.Version.parse(release_name) catch log_failure_to_parse_version_and_exit(release_name);
+            break :errblk semver.Version.parse(release_name) catch
+                log_failure_to_parse_version_and_exit(io, release_name);
         }
         try stderr_print(
+            io,
             "error: couldn't parse latest release name '{s}' (nor '{s}') as a version",
             .{ latest_release.value.name, release_name },
         );
@@ -111,7 +121,7 @@ pub fn upgrade(alloc: std.mem.Allocator, current_version: semver.Version, overri
     };
 
     if (!latest_version.has_precendence_over(current_version)) {
-        try stderr_print("the current version ({}) is up to date", .{current_version});
+        try stderr_print(io, "the current version ({f}) is up to date", .{current_version});
         return;
     }
 
@@ -122,126 +132,122 @@ pub fn upgrade(alloc: std.mem.Allocator, current_version: semver.Version, overri
     // find the asset with the name "ziglint-<platform>-<arch>"
     for (latest_release.value.assets) |asset| {
         if (std.mem.eql(u8, asset.name, executable_name)) {
-            try stderr_print("downloading {s} version {s}...", .{ asset.name, latest_version });
+            try stderr_print(io, "downloading {s} version {f}...", .{ asset.name, latest_version });
 
-            const uri = try std.Uri.parse(asset.url);
-            var client = std.http.Client{ .allocator = alloc };
+            const download_url = asset.browser_download_url orelse asset.url;
+            const uri = try std.Uri.parse(download_url);
+            var client: std.http.Client = .{ .allocator = alloc, .io = io };
             defer client.deinit();
 
-            var buf: [4096]u8 = undefined;
-            var ziglint_request = try client.open(.GET, uri, .{ .server_header_buffer = &buf });
-            ziglint_request.headers.accept_encoding.override = asset.content_type;
-            defer ziglint_request.deinit();
+            var download: std.Io.Writer.Allocating = .init(alloc);
+            defer download.deinit();
 
-            try ziglint_request.send();
-            try ziglint_request.finish();
-            try ziglint_request.wait();
+            const extra_headers: []const std.http.Header = if (asset.browser_download_url == null)
+                &.{.{ .name = "Accept", .value = "application/octet-stream" }}
+            else
+                &.{};
 
-            if (ziglint_request.response.status != .ok) {
+            const response = try client.fetch(.{
+                .location = .{ .uri = uri },
+                .extra_headers = extra_headers,
+                .response_writer = &download.writer,
+            });
+
+            if (response.status != .ok) {
                 try stderr_print(
-                    "error: couldn't download {s} version {s}: HTTP status {}",
-                    .{ asset.name, latest_version, ziglint_request.response.status },
+                    io,
+                    "error: couldn't download {s} version {f}: HTTP status {t}",
+                    .{ asset.name, latest_version, response.status },
                 );
                 std.process.exit(1);
             }
 
-            var tmpdir = std.testing.tmpDir(.{});
-            defer tmpdir.cleanup();
-            // open a file in the tmpdir to write into
-            var tmpfile = try tmpdir.dir.createFile(executable_name, .{});
-            defer tmpfile.close();
-
-            // reuse the API buffer to write the file to disk
-            var n = try ziglint_request.readAll(api_buffer);
-            while (n > 0) {
-                try tmpfile.writeAll(api_buffer[0..n]);
-                n = try ziglint_request.readAll(api_buffer);
-            }
+            const binary_bytes = download.writer.buffered();
 
             // replace ourselves with a new ziglint
-            const our_path = try std.fs.selfExePathAlloc(alloc);
+            const our_path = try std.process.executablePathAlloc(io, alloc);
             defer alloc.free(our_path);
             if (builtin.target.os.tag == .linux and std.mem.endsWith(u8, our_path, " (deleted)")) {
-                try stderr_print("it looks like your ziglint binary ('{s}') was deleted while it was running;" ++
+                try stderr_print(io, "it looks like your ziglint binary ('{s}') was deleted while it was running;" ++
                     "it will be reinstalled, but if you really are trying to name your ziglint '(deleted)', " ++
                     "you should rename it afterwards!", .{our_path});
             }
-            const new_exe_path = try tmpdir.dir.realpathAlloc(alloc, executable_name);
-            defer alloc.free(new_exe_path);
-            std.fs.copyFileAbsolute(new_exe_path, our_path, .{}) catch |err| {
+
+            install_executable(io, .cwd(), our_path, binary_bytes) catch |err| {
                 // if we can move the new ziglint to /usr/local/bin (on Mac/Linux) or C:\Program Files (on Windows),
                 // we do so
                 const local_bin = if (builtin.target.os.tag == .windows) "C:\\Program Files" else "/usr/local/bin";
-                const dest_dir = try std.fs.openDirAbsolute(local_bin, .{});
+                const local_name = "ziglint" ++ extension;
+                var dest_dir = try std.Io.Dir.openDirAbsolute(io, local_bin, .{});
+                defer dest_dir.close(io);
 
-                std.fs.Dir.copyFile(tmpdir.dir, executable_name, dest_dir, "ziglint", .{}) catch |err2| {
-                    if (std.fs.cwd().statFile("ziglint") == error.FileNotFound) {
-                        std.fs.Dir.copyFile(tmpdir.dir, executable_name, std.fs.cwd(), "ziglint", .{}) catch |err3| {
+                install_executable(io, dest_dir, local_name, binary_bytes) catch |err2| {
+                    if (std.Io.Dir.cwd().statFile(io, local_name, .{}) == error.FileNotFound) {
+                        install_executable(io, .cwd(), local_name, binary_bytes) catch |err3| {
                             try stderr_print(
+                                io,
                                 "error: couldn't replace myself, copy the new ziglint to {s}," ++
                                     "or copy it to the current directory\n" ++
-                                    "errors: {}, {}, {}",
+                                    "errors: {t}, {t}, {t}",
                                 .{ local_bin, err, err2, err3 },
                             );
                             std.process.exit(1);
                         };
-                        try make_executable(try std.fs.cwd().openFile("ziglint", .{}));
-                        try stderr_print("couldn't replace the ziglint you're running with the new version;" ++
+                        try stderr_print(io, "couldn't replace the ziglint you're running with the new version;" ++
                             "installed ziglint to the current directory instead", .{});
                     } else {
-                        try stderr_print("couldn't replace the ziglint you're running with the new version " ++
+                        try stderr_print(io, "couldn't replace the ziglint you're running with the new version " ++
                             "or install ziglint in an alternate location." ++
                             "try deleting the ziglint file from your current directory " ++
-                            "or giving this program permissions to modify {}.", .{dest_dir});
+                            "or giving this program permissions to modify {s}.", .{local_bin});
                     }
                     return;
                 };
-                try make_executable(try dest_dir.openFile("ziglint", .{}));
-                try stderr_print("couldn't replace the ziglint you're running with the new version; " ++
-                    "installed ziglint to {} instead", .{dest_dir});
+                try stderr_print(io, "couldn't replace the ziglint you're running with the new version; " ++
+                    "installed ziglint to {s} instead", .{local_bin});
                 return;
             };
-            try make_executable(try std.fs.openFileAbsolute(our_path, .{}));
-            try stderr_print("successfully upgraded ziglint to version {}!", .{latest_version});
+            try stderr_print(io, "successfully upgraded ziglint to version {f}!", .{latest_version});
 
             return;
         }
     }
     try stderr_print(
-        "version {s} of ziglint has been released (you're running version {s}), " ++
+        io,
+        "version {f} of ziglint has been released (you're running version {f}), " ++
             "but it's not currently available for your processor and operating system ({s}).",
         .{ latest_version, current_version, target },
     );
 }
 
-// caller must free with std.json.parseFree
-fn access_api(alloc: std.mem.Allocator, api_url: std.Uri, api_buffer: []u8) !std.json.Parsed(GithubRelease) {
-    // attempt to access the API endpoint and parse its JSON
-    var client = std.http.Client{ .allocator = alloc };
+fn install_executable(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) !void {
+    var atomic_file = try dir.createFileAtomic(io, sub_path, .{
+        .permissions = .executable_file,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+    try atomic_file.file.writeStreamingAll(io, bytes);
+    try atomic_file.replace(io);
+}
+
+// caller must free with Parsed.deinit()
+fn access_api(io: std.Io, alloc: std.mem.Allocator, api_url: std.Uri) !std.json.Parsed(GithubRelease) {
+    var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
 
-    // based on example code for new http API from here: https://ziggit.dev/t/simple-http-fetch-request/4456/2
-    var buf: [4096]u8 = undefined;
-    var api_request = try client.open(.GET, api_url, .{ .server_header_buffer = &buf });
-    defer api_request.deinit();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
 
-    try api_request.send();
-    try api_request.finish();
-    try api_request.wait();
+    const response = try client.fetch(.{
+        .location = .{ .uri = api_url },
+        .response_writer = &aw.writer,
+    });
+    if (response.status != .ok) return error.HttpStatusNotOk;
 
-    const raw_response = api_buffer[0..try api_request.readAll(api_buffer)];
-    return std.json.parseFromSlice(GithubRelease, alloc, raw_response, .{ .ignore_unknown_fields = true });
+    return std.json.parseFromSlice(GithubRelease, alloc, aw.writer.buffered(), .{ .ignore_unknown_fields = true });
 }
 
-// chmod +x
-fn make_executable(file: std.fs.File) !void {
-    if (builtin.target.os.tag == .windows) return; // I don't know how to do this on Windows
-
-    const stat = try file.stat();
-    try file.chmod(stat.mode | 0o111);
-}
-
-fn log_failure_to_parse_version_and_exit(release_name: []const u8) noreturn {
-    stderr_print("error: couldn't parse latest release name '{s}' as a version", .{release_name}) catch unreachable;
+fn log_failure_to_parse_version_and_exit(io: std.Io, release_name: []const u8) noreturn {
+    stderr_print(io, "error: couldn't parse latest release name '{s}' as a version", .{release_name}) catch unreachable;
     std.process.exit(1);
 }

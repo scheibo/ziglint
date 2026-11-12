@@ -1,0 +1,29 @@
+name: 'Install ziglint'
+description: 'Installs the ziglint tool for static analysis of Zig code'
+branding:
+  icon: 'download-cloud'
+  color: 'blue'
+inputs:
+  binary-name:
+    description: 'Name to install the ziglint binary as'
+    required: false
+    default: 'ziglint'
+  token:
+    description: 'GitHub API token to use for downloading ziglint'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download or build ziglint
+      shell: bash
+      env:
+        INPUT_BINARY_NAME: ${{ inputs.binary-name }}
+        INPUT_TOKEN: ${{ inputs.token }}
+      run: node "${GITHUB_ACTION_PATH//\\//}/install.mjs"
+    - name: Verify ziglint
+      shell: bash
+      env:
+        INPUT_BINARY_NAME: ${{ inputs.binary-name }}
+      run: '"$INPUT_BINARY_NAME" version'

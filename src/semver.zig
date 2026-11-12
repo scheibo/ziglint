@@ -152,8 +152,8 @@ pub const Version = struct {
         return false;
     }
 
-    pub fn format(value: Version, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("{}.{}.{}", .{ value.major, value.minor, value.patch });
+    pub fn format(value: Version, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{d}.{d}.{d}", .{ value.major, value.minor, value.patch });
         if (value.prerelease) |prerelease| {
             try writer.print("-{s}", .{prerelease});
         }

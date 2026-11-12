@@ -13,20 +13,29 @@ pub const IgnoreTracker = struct {
     excludes: std.ArrayList([]const u8),
     includes: std.ArrayList([]const u8),
     base_path: []const u8,
+    cwd_path: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, base_path: []const u8) IgnoreTracker {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        cwd_path: []const u8,
+        environ_map: ?*const std.process.Environ.Map,
+        base_path: []const u8,
+    ) IgnoreTracker {
         return IgnoreTracker{
-            .excludes = std.ArrayList([]const u8).init(allocator),
-            .includes = std.ArrayList([]const u8).init(allocator),
+            .excludes = .empty,
+            .includes = .empty,
             .base_path = base_path,
+            .cwd_path = cwd_path,
+            .environ_map = environ_map,
             .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *const IgnoreTracker) void {
-        self.excludes.deinit();
-        self.includes.deinit();
+    pub fn deinit(self: *IgnoreTracker) void {
+        self.excludes.deinit(self.allocator);
+        self.includes.deinit(self.allocator);
     }
 
     /// Parses statements from a .gitignore file and adds them to the tracker
@@ -36,29 +45,35 @@ pub const IgnoreTracker = struct {
 
         while (line != null) : (line = split.next()) {
             // remove stray \r characters from Windows line endings
-            line = std.mem.trimRight(u8, line.?, "\r");
+            line = std.mem.trimEnd(u8, line.?, "\r");
             if (line.?.len == 0) continue;
             switch (line.?[0]) {
                 // comment
                 '#' => continue,
                 // include (negated ignore)
                 // TODO: do we need to unescape?
-                '!' => try self.includes.append(line.?[1..]),
-                else => try self.excludes.append(line.?),
+                '!' => try self.includes.append(self.allocator, line.?[1..]),
+                else => try self.excludes.append(self.allocator, line.?),
             }
         }
     }
 
     pub fn add_slice_to_includes(self: *IgnoreTracker, slice: [][]const u8) !void {
-        try self.includes.appendSlice(slice);
+        try self.includes.appendSlice(self.allocator, slice);
     }
 
     pub fn add_slice_to_excludes(self: *IgnoreTracker, slice: [][]const u8) !void {
-        try self.excludes.appendSlice(slice);
+        try self.excludes.appendSlice(self.allocator, slice);
     }
 
     pub fn is_ignored(self: *const IgnoreTracker, path: []const u8) !bool {
-        const relative_path = try std.fs.path.relative(self.allocator, self.base_path, path);
+        const relative_path = try std.fs.path.relativeAlloc(
+            self.allocator,
+            self.cwd_path,
+            self.environ_map,
+            self.base_path,
+            path,
+        );
         defer self.allocator.free(relative_path);
 
         for (self.includes.items) |include_pattern| {

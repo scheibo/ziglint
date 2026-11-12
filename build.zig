@@ -11,9 +11,12 @@ pub fn build(b: *std.Build) !void {
     if (is_release) {
         build_options.addOption(?[]const u8, "GIT_COMMIT_HASH", null);
     } else {
-        const git_result = try b.default_step.evalChildProcess(&.{ "git", "rev-parse", "--short", "HEAD" });
-        // drop the last character (newline)
-        build_options.addOption(?[]const u8, "GIT_COMMIT_HASH", git_result[0 .. git_result.len - 1]);
+        b.graph.poisonCache();
+        const git_hash: ?[]const u8 = switch (b.runFallible(&.{ "git", "rev-parse", "--short", "HEAD" }, .{})) {
+            .success => |stdout| std.mem.trimEnd(u8, stdout, "\r\n"),
+            else => null,
+        };
+        build_options.addOption(?[]const u8, "GIT_COMMIT_HASH", git_hash);
     }
 
     // Standard target options allows the person running `zig build` to choose
@@ -29,11 +32,13 @@ pub fn build(b: *std.Build) !void {
 
     const exe = b.addExecutable(.{
         .name = "ziglint",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            // In this case the main source file is merely a path, however, in more
+            // complicated build scripts, this could be a generated file.
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     exe.root_module.addOptions("comptime_build", build_options);
 
@@ -55,9 +60,7 @@ pub fn build(b: *std.Build) !void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // This creates a build step. It will be visible in the `zig build --help` menu,
     // and can be selected like this: `zig build run`
@@ -68,19 +71,25 @@ pub fn build(b: *std.Build) !void {
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const analysis_tests = b.addTest(.{
-        .root_source_file = b.path("src/analysis.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/analysis.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     const semver_tests = b.addTest(.{
-        .root_source_file = b.path("src/semver.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/semver.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     const gitignore_tests = b.addTest(.{
-        .root_source_file = b.path("src/gitignore.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gitignore.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const run_analysis_tests = b.addRunArtifact(analysis_tests);
@@ -94,20 +103,16 @@ pub fn build(b: *std.Build) !void {
     // Don't run integration tests on Windows; they expect UNIX-style '/' path separators
     if (builtin.target.os.tag != .windows) {
         const integration_tests = b.addExecutable(.{
-            .root_source_file = b.path("testcases/run.zig"),
             .name = "integration_test",
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("testcases/run.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
         });
-        integration_tests.step.dependOn(b.getInstallStep());
         const run_integration_tests = b.addRunArtifact(integration_tests);
-        // const exe_name = try std.mem.concat(b.allocator, u8, &[_][]const u8{ "ziglint", target.exeFileExt() });
-        // const ziglint_path = try std.fs.path.join(b.allocator, &.{ b.exe_dir, exe_name });
-
-        const out_dir_path = try b.path("zig-out").join(b.allocator, "bin");
-        const out_file_path = try out_dir_path.join(b.allocator, exe.out_filename);
-        run_integration_tests.addArgs(&.{out_file_path.getPath(b)}); // TODO: see if this works
-        run_integration_tests.cwd = b.path("testcases");
+        run_integration_tests.addArtifactArg(exe);
+        run_integration_tests.setCwd(b.path("testcases"));
 
         test_step.dependOn(&run_integration_tests.step);
     }

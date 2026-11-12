@@ -1,3 +1,7 @@
+### 0.0.9
+- Updated to build with Zig 0.18.0-dev (`master`) and use its formatting rules.
+- Added root `action.yml` to install `ziglint` directly in GitHub Actions.
+
 ### 0.0.8
 - Updated to build with Zig 0.14.1 and use its formatting rules.
  

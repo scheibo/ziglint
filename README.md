@@ -1,21 +1,26 @@
 # ziglint
-[![Zig CI](https://github.com/AnnikaCodes/ziglint/actions/workflows/ci.yml/badge.svg)](https://github.com/AnnikaCodes/ziglint/actions/workflows/ci.yml)
+[![Zig CI](https://github.com/scheibo/ziglint/actions/workflows/ci.yml/badge.svg)](https://github.com/scheibo/ziglint/actions/workflows/ci.yml)
 
 `ziglint` is a configurable code analysis tool for Zig codebases. It's a work in progress and doesn't have many features at the moment, but it can be used.
 
 Right now, there are only five functional linting rules: [`max_line_length`](#max_line_length), [`check_format`](#check_format), [`dupe_import`](#dupe_import), [`file_as_struct`](#file_as_struct), and [`banned_comment_phrases`](#banned_comment_phrases). However, more rules are planned.
 
 # Installation
-Prebuilt `ziglint` binaries for the most common platforms are available through [GitHub Releases](https://github.com/AnnikaCodes/ziglint/releases/latest); this is the recommended way to install `ziglint`.
+Prebuilt `ziglint` binaries for the most common platforms are available through [GitHub Releases](https://github.com/scheibo/ziglint/releases/latest); this is the recommended way to install `ziglint`.
 You should rename the binary to `ziglint` and put it somewhere in your shell's `PATH`. For example:
 ```bash
 mv ziglint-macos-x86_64 /usr/local/bin/ziglint
 chmod +x /usr/local/bin/ziglint
 ```
 
-If you use GitHub Actions, the [`AnnikaCodes/install-ziglint` Action](https://github.com/marketplace/actions/install-ziglint) will install `ziglint` onto your runner for you, so you can use it in your workflows without having to manually install it.
+If you use GitHub Actions, `scheibo/ziglint@main` can be used directly as an Action to install `ziglint` onto your runner:
+```yaml
+- uses: scheibo/ziglint@main
+  with:
+    token: ${{ secrets.GITHUB_TOKEN }}
+```
 
-Windows users should know that `ziglint` has not been thoroughly tested on Windows; it should work fine, but please [report any bugs](https://github.com/AnnikaCodes/ziglint/issues/new).
+Windows users should know that `ziglint` has not been thoroughly tested on Windows; it should work fine, but please [report any bugs](https://github.com/scheibo/ziglint/issues/new).
 
 macOS users should know that `ziglint` has not been codesigned, so you may need to explicitly allow it to run in System Preferences' "Privacy & Security" section: <details>
     <summary>image showing the System Preferences button you may need to click</summary>
