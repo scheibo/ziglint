@@ -124,15 +124,19 @@ pub const ASTAnalyzer = struct {
 
             if (c == '\n' or tree.source[idx + 1] == 0 or (c == '\r' and tree.source[idx + 1] != '\n')) {
                 // The line has ended - run per-line rules
-                const line = tree.source[current_line_start..idx];
+                const line_end = if (c == '\n' and idx > current_line_start and tree.source[idx - 1] == '\r')
+                    idx - 1
+                else
+                    idx;
+                const line = tree.source[current_line_start..line_end];
                 if (self.max_line_length.limit != 0) {
                     try self.max_line_length.check_line(alloc, &faults, line, current_line_number);
                 }
 
                 if (comment_start_idx) |start_idx| {
                     // check for ziglint: ignore remark
-                    if (idx > "ziglint: ignore\n".len and
-                        std.mem.eql(u8, tree.source[(idx - "ziglint: ignore".len)..idx], "ziglint: ignore"))
+                    if (line_end > "ziglint: ignore\n".len and
+                        std.mem.eql(u8, tree.source[(line_end - "ziglint: ignore".len)..line_end], "ziglint: ignore"))
                     {
                         // if it's standalone, then disable ziglint for the next line
                         // otherwise, disable for this line
@@ -141,7 +145,7 @@ pub const ASTAnalyzer = struct {
                     }
 
                     // run per-comment rules
-                    const comment = tree.source[start_idx..idx];
+                    const comment = tree.source[start_idx..line_end];
                     if (self.banned_comment_phrases != null) {
                         try banned_comment_phrases.check_comment(alloc, &faults, comment, current_line_number);
                     }
@@ -252,6 +256,12 @@ const Tests = struct {
                         .fault_type = SourceCodeFaultType{ .LineTooLong = 121 },
                     },
                 },
+            },
+            TestCase{
+                .source = "// " ++ &@as([117]u8, @splat('a')) ++ "\r\n" ++
+                    "// ziglint: ignore\r\n" ++
+                    "// " ++ &@as([130]u8, @splat('b')) ++ "\r\n",
+                .expected_faults = &.{},
             },
         });
     }
